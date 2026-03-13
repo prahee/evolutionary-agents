@@ -1,78 +1,91 @@
-"""
-Experiment configuration for Multi-Agent POMDP Door Navigation.
+"""Experiment configuration with multiple reproduction triggers."""
 
-All tunable parameters live here so experiments are fully reproducible.
-"""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional
-import json
-import time
+from pathlib import Path
+
+
+def get_allowed_models() -> list[str]:
+    path = Path(__file__).resolve().parent.parent / "models.txt"
+    if not path.exists():
+        return []
+    return [l.strip() for l in path.read_text().splitlines() if l.strip()]
+
+
+def validate_model(name: str) -> None:
+    allowed = get_allowed_models()
+    if allowed and name not in allowed:
+        raise ValueError(f"Model '{name}' not in models.txt")
+
+
+@dataclass
+class TrialConfig:
+    """Configuration for a single experimental trial."""
+
+    # --- Environment (graph POMDP) ---
+    num_nodes: int = 20
+    connection_radius: float = 0.35
+    num_doors: int = 5
+    hints_per_door: int = 3
+    distractors_per_door: int = 2
+    max_signals_per_observation: int = 4
+    observation_hops: int = 1
+    random_seed: int | None = None
+    min_goal_distance: int = 3
+
+    # --- Agent context ---
+    max_context_tokens: int = 750
+    max_prior_tokens: int = 150
+
+    # --- Reproduction ---
+    interactions_per_lifetime: int = 10
+    reproduce_on_success: bool = True
+    reproduce_on_novelty: bool = False
+    novelty_threshold: float = 0.7
+    max_children_per_agent: int = 5
+
+    # --- Features ---
+    inherit_prior: bool = True
+    enable_parent_query: bool = False
+    max_parent_queries: int = 3
+    parent_query_steps: tuple[int, ...] = (0, 3, 7)
+    enable_skill_library: bool = False
+    enable_bayesian: bool = False
+
+    # --- Cloaking (potential-theory signal attenuation) ---
+    enable_cloaking: bool = False
+    cloak_inner_radius: float = 0.25
+    cloak_outer_radius: float = 0.40
+
+    # --- Lifecycle ---
+    max_steps: int = 500
+    success_count: int = 3
+    num_root_agents: int = 2
+
+    # --- LLM ---
+    reasoning_model: str = "openai.gpt-4.1-mini-2025-04-14"
+    utility_model: str = "vertex_ai.gemini-2.0-flash-001"
+    max_steps_per_trial: int = 300
+
+    # --- Logging ---
+    log_transcript: bool = True
+
+
+def validate_config_models(config: TrialConfig) -> None:
+    validate_model(config.reasoning_model)
+    validate_model(config.utility_model)
 
 
 @dataclass
 class ExperimentConfig:
-    # --- Environment ---
-    use_graph_world: bool = True  # True = random geometric graph, False = rectangular grid
-    num_doors: int = 4
+    """Configuration for a multi-trial experiment."""
 
-    # Graph world params (when use_graph_world=True)
-    num_nodes: int = 20  # total nodes in random geometric graph
-    connection_radius: float = 0.35  # nodes within this distance are connected
-    observation_hops: int = 1  # how far agent can see in the graph
+    name: str = "experiment"
+    num_trials: int = 5
+    trial: TrialConfig = field(default_factory=TrialConfig)
+    output_dir: str = "results"
 
-    # Grid world params (when use_graph_world=False)
-    grid_size: tuple[int, int] = (6, 6)
-    num_walls: int = 5
-    observation_radius: int = 1
-
-    # --- Signals ---
-    hints_per_door: int = 3
-    distractors_per_door: int = 3
-    max_signals_per_observation: int = 3  # how many signals agent sees when adjacent to door
-
-    # --- Agent ---
-    max_context_tokens: int = 1500  # approximate token budget for working memory
-    max_context_entries: int = 15  # max (obs, action, reasoning) triples before compression
-    interactions_per_lifetime: int = 50  # interactions before reproduction
-    max_steps_per_trial: int = 300  # hard cap to prevent infinite loops
-
-    # --- Reproduction ---
-    prior_mutation_rate: float = 0.0  # 0.0 = exact copy, 1.0 = full rephrase (set >0 for mutation experiment)
-    parent_resets_after_birth: bool = True  # reset parent interaction count after spawning child
-    max_generations: int = 5  # prevent runaway spawning
-
-    # --- Experiment ---
-    success_threshold: int = 3  # stop after N successful agents
-    num_trials: int = 10  # number of independent experiment runs
-    num_root_agents: int = 1  # starting agents per trial
-    random_seed: Optional[int] = 42
-
-    # --- Baselines ---
-    run_no_prior_baseline: bool = True
-    run_random_walk_baseline: bool = True
-    run_oracle_prior_baseline: bool = True
-    run_random_prior_baseline: bool = True  # gibberish prior control
-
-    # --- Model ---
-    model_name: str = "claude-haiku-4-5-20251001"  # fast + cheap; upgrade to claude-sonnet-4-20250514 for final runs
-
-    # --- Output ---
-    results_dir: str = "results"
-
-    def to_dict(self) -> dict:
-        d = {}
-        for k, v in self.__dict__.items():
-            d[k] = v
-        return d
-
-    def save(self, path: str):
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
-
-    @classmethod
-    def load(cls, path: str) -> "ExperimentConfig":
-        with open(path) as f:
-            return cls(**json.load(f))
-
-    def experiment_id(self) -> str:
-        return f"exp_{int(time.time())}"
+    sweep_param: str | None = None
+    sweep_values: list = field(default_factory=list)
+    conditions: dict[str, dict] = field(default_factory=dict)

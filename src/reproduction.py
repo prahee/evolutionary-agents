@@ -1,160 +1,106 @@
-"""
-Reproduction system: prior compression, agent birth, lineage tracking.
+"""Agent reproduction: prior compression, birth, lineage tracking.
 
-When an agent hits its interaction limit, it:
-  1. Compresses its experience into a prior
-  2. Optionally mutates the prior (controlled by mutation_rate)
-  3. Spawns a child agent with the prior as initial knowledge
-  4. The lineage is tracked for later analysis
+Supports multiple reproduction triggers:
+  - periodic: after N interactions
+  - on_success: agent finds the goal, births a child before retiring
+  - on_context_overflow: when context buffer overflows (not yet implemented)
 """
-import random
-import uuid
+
+from __future__ import annotations
+
+import itertools
 from dataclasses import dataclass, field
-from typing import Optional
 
-from src.agent import Agent, AgentType, AgentState
+from .agent import Agent
+from .config import TrialConfig
+
+
+_counter = itertools.count(1)
+
+
+def next_id() -> str:
+    return f"agent_{next(_counter)}"
+
+
+def reset_id_counter() -> None:
+    global _counter
+    _counter = itertools.count(1)
 
 
 @dataclass
-class LineageNode:
-    agent_id: str
-    parent_id: Optional[str]
+class BirthEvent:
+    parent_id: str
+    child_id: str
     generation: int
-    prior: str
-    success: bool = False
-    steps_taken: int = 0
-    children: list[str] = field(default_factory=list)
+    step: int
+    trigger: str  # "periodic", "on_success", "on_context_overflow"
+    parent_prior: str
+    child_prior: str
+    parent_context_snapshot: str
 
 
-class LineageTracker:
-    """Tracks the full parent→child tree across an experiment run."""
+@dataclass
+class Lineage:
+    parents: dict[str, str | None] = field(default_factory=dict)
+    generations: dict[str, int] = field(default_factory=dict)
+    births: list[BirthEvent] = field(default_factory=list)
 
-    def __init__(self):
-        self.nodes: dict[str, LineageNode] = {}
+    def add_root(self, agent_id: str) -> None:
+        self.parents[agent_id] = None
+        self.generations[agent_id] = 0
 
-    def register(self, agent: Agent):
-        node = LineageNode(
-            agent_id=agent.state.agent_id,
-            parent_id=agent.state.parent_id,
-            generation=agent.state.generation,
-            prior=agent.state.prior,
-        )
-        self.nodes[agent.state.agent_id] = node
-        if agent.state.parent_id and agent.state.parent_id in self.nodes:
-            self.nodes[agent.state.parent_id].children.append(agent.state.agent_id)
+    def add_birth(self, event: BirthEvent) -> None:
+        self.parents[event.child_id] = event.parent_id
+        self.generations[event.child_id] = event.generation
+        self.births.append(event)
 
-    def mark_success(self, agent_id: str, steps: int):
-        if agent_id in self.nodes:
-            self.nodes[agent_id].success = True
-            self.nodes[agent_id].steps_taken = steps
+    def get_depth(self, agent_id: str) -> int:
+        return self.generations.get(agent_id, 0)
 
-    def mark_failure(self, agent_id: str, steps: int):
-        if agent_id in self.nodes:
-            self.nodes[agent_id].steps_taken = steps
+    def max_generation(self) -> int:
+        return max(self.generations.values()) if self.generations else 0
 
-    def get_tree(self) -> dict:
-        """Export lineage as a serializable dict."""
-        return {
-            aid: {
-                "parent": node.parent_id,
-                "generation": node.generation,
-                "prior_preview": node.prior[:100] + "..." if len(node.prior) > 100 else node.prior,
-                "full_prior": node.prior,
-                "success": node.success,
-                "steps_taken": node.steps_taken,
-                "children": node.children,
-            }
-            for aid, node in self.nodes.items()
-        }
+    def tree_str(self, successful: set[str] | None = None) -> str:
+        successful = successful or set()
+        roots = [a for a, p in self.parents.items() if p is None]
+        lines: list[str] = []
 
-    def get_generation_stats(self) -> dict[int, dict]:
-        """Aggregate stats by generation."""
-        gen_data: dict[int, list[LineageNode]] = {}
-        for node in self.nodes.values():
-            gen_data.setdefault(node.generation, []).append(node)
+        def visit(aid: str, prefix: str, is_last: bool) -> None:
+            marker = "└── " if is_last else "├── "
+            tag = " [SUCCESS]" if aid in successful else ""
+            gen = self.generations.get(aid, "?")
+            trigger = ""
+            for b in self.births:
+                if b.child_id == aid:
+                    trigger = f" ({b.trigger})"
+                    break
+            lines.append(f"{prefix}{marker}{aid} (gen {gen}){trigger}{tag}")
+            children = [c for c, p in self.parents.items() if p == aid]
+            new_prefix = prefix + ("    " if is_last else "│   ")
+            for i, c in enumerate(children):
+                visit(c, new_prefix, i == len(children) - 1)
 
-        stats = {}
-        for gen, nodes in sorted(gen_data.items()):
-            successes = [n for n in nodes if n.success]
-            all_steps = [n.steps_taken for n in nodes if n.steps_taken > 0]
-            stats[gen] = {
-                "total_agents": len(nodes),
-                "successes": len(successes),
-                "success_rate": len(successes) / len(nodes) if nodes else 0,
-                "avg_steps": sum(all_steps) / len(all_steps) if all_steps else 0,
-                "min_steps": min(all_steps) if all_steps else 0,
-                "max_steps": max(all_steps) if all_steps else 0,
-            }
-        return stats
-
-
-def mutate_prior(prior: str, mutation_rate: float, llm, rng: random.Random) -> str:
-    """
-    Mutate a prior with some probability.
-
-    mutation_rate = 0.0: exact copy (no mutation)
-    mutation_rate = 1.0: completely rephrase
-    """
-    if mutation_rate <= 0 or not prior:
-        return prior
-
-    if rng.random() > mutation_rate:
-        return prior  # no mutation this time
-
-    # Ask LLM to rephrase/challenge one assumption
-    try:
-        result = llm.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=300,
-            system=(
-                "You are introducing slight variation into exploration knowledge. "
-                "Take the following set of heuristics and change ONE of them — either "
-                "rephrase it, weaken its certainty, or challenge its assumption. "
-                "Keep all other heuristics intact. Return the full modified set."
-            ),
-            messages=[
-                {"role": "user", "content": f"Original heuristics:\n{prior}\n\nModified version:"},
-            ],
-        )
-        return result.content[0].text[:500]
-    except Exception:
-        return prior  # on failure, don't mutate
+        for i, r in enumerate(roots):
+            visit(r, "", i == len(roots) - 1)
+        return "\n".join(lines)
 
 
 def birth_agent(
     parent: Agent,
-    llm,
-    config,
-    rng: random.Random,
+    prior: str,
+    config: TrialConfig,
+    reasoning_llm=None,
+    utility_llm=None,
 ) -> Agent:
-    """
-    Create a child agent from a parent.
-
-    1. Parent generates prior from its experience
-    2. Prior is optionally mutated
-    3. Child is created with the prior as initial knowledge
-    """
-    # Generate prior
-    prior = parent.generate_prior()
-
-    # Mutate if configured
-    if config.prior_mutation_rate > 0:
-        prior = mutate_prior(prior, config.prior_mutation_rate, llm, rng)
-
-    # Create child
-    child_id = f"agent_g{parent.state.generation + 1}_{uuid.uuid4().hex[:6]}"
-    child = Agent(
-        agent_id=child_id,
-        llm=llm,
+    """Create a child agent inheriting a compressed prior."""
+    aid = next_id()
+    parent.children_birthed += 1
+    return Agent(
+        agent_id=aid,
         config=config,
-        agent_type=AgentType.EXPERIMENTAL,
-        prior=prior,
-        generation=parent.state.generation + 1,
-        parent_id=parent.state.agent_id,
-        rng=rng,
-        graph_mode=parent.graph_mode,
+        prior=prior if config.inherit_prior else "",
+        parent_id=parent.agent_id,
+        generation=parent.generation + 1,
+        reasoning_llm=reasoning_llm or parent.reasoning_llm,
+        utility_llm=utility_llm or parent.utility_llm,
     )
-
-    parent.state.children_ids.append(child_id)
-
-    return child
